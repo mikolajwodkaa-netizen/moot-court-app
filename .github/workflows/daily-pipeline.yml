@@ -1,0 +1,126 @@
+name: Daily Idea Pipeline
+
+on:
+  schedule:
+    # 06:00 UTC every day — adjust to your timezone preference
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  RUN_DATE: ${{ github.run_id }}   # unique per run; scripts also stamp today's date
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Stage 1-4: ingest repo, generate 40 ideas, debate/vote to 3, write
+  # build prompts. These are cheap, fast, and sequential, so one job.
+  # ---------------------------------------------------------------------
+  ideate:
+    runs-on: ubuntu-latest
+    outputs:
+      run_dir: ${{ steps.setpaths.outputs.run_dir }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r scripts/requirements.txt
+
+      - id: setpaths
+        run: echo "run_dir=runs/$(date +%F)" >> "$GITHUB_OUTPUT"
+
+      - name: Ingest codebase context
+        run: python scripts/ingest_context.py . "${{ steps.setpaths.outputs.run_dir }}"
+
+      - name: Generate ideas
+        run: python scripts/generate_ideas.py "${{ steps.setpaths.outputs.run_dir }}"
+
+      - name: Debate and vote down to winners
+        run: python scripts/debate_vote.py "${{ steps.setpaths.outputs.run_dir }}"
+
+      - name: Write build prompts
+        run: python scripts/make_build_prompts.py "${{ steps.setpaths.outputs.run_dir }}"
+
+      - name: Upload run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ideation-${{ steps.setpaths.outputs.run_dir }}
+          path: ${{ steps.setpaths.outputs.run_dir }}
+
+  # ---------------------------------------------------------------------
+  # Stage 5: for each winning idea, generate a pros/cons doc + mockup.html
+  # via a single API call. No repo access, no code changes, no git
+  # branches — just written analysis and a visual mockup.
+  # ---------------------------------------------------------------------
+  build:
+    needs: ideate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        idea_index: [0,1,2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r scripts/requirements.txt
+
+      - name: Download ideation artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ideation-${{ needs.ideate.outputs.run_dir }}
+          path: ${{ needs.ideate.outputs.run_dir }}
+
+      - name: Generate docs + mockup for idea ${{ matrix.idea_index }}
+        run: |
+          python scripts/build_idea.py \
+            "${{ needs.ideate.outputs.run_dir }}" \
+            "${{ matrix.idea_index }}"
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.idea_index }}
+          path: ${{ needs.ideate.outputs.run_dir }}/idea_${{ matrix.idea_index }}
+
+  # ---------------------------------------------------------------------
+  # Stage 6: collect everything into one digest
+  # ---------------------------------------------------------------------
+  digest:
+    needs: [ideate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r scripts/requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: ${{ needs.ideate.outputs.run_dir }}
+          merge-multiple: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ideation-${{ needs.ideate.outputs.run_dir }}
+          path: ${{ needs.ideate.outputs.run_dir }}
+
+      - name: Build digest
+        run: python scripts/build_digest.py "${{ needs.ideate.outputs.run_dir }}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ needs.ideate.outputs.run_dir }}
+          path: ${{ needs.ideate.outputs.run_dir }}/digest.html
